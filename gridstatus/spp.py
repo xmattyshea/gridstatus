@@ -1,15 +1,10 @@
-import io
-import re
-from urllib.parse import urlencode
-
 import pandas as pd
 import requests
 import tqdm
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 from gridstatus import utils
 from gridstatus.base import (
-    GridStatus,
     InterconnectionQueueStatus,
     ISOBase,
     Markets,
@@ -21,12 +16,14 @@ from gridstatus.lmp_config import lmp_config
 
 FS_RTBM_LMP_BY_LOCATION = "rtbm-lmp-by-location"
 FS_DAM_LMP_BY_LOCATION = "da-lmp-by-location"
-MARKETPLACE_BASE_URL = "https://marketplace.spp.org"
-FILE_BROWSER_API_URL = "https://marketplace.spp.org/file-browser-api/"
+MARKETPLACE_BASE_URL = "https://portal.spp.org"
+FILE_BROWSER_API_URL = "https://portal.spp.org/file-browser-api/"
+FILE_BROWSER_DOWNLOAD_URL = "https://portal.spp.org/file-browser-api/download"
 
-LOCATION_TYPE_HUB = "HUB"
-LOCATION_TYPE_INTERFACE = "INTERFACE"
-LOCATION_TYPE_SETTLEMENT_LOCATION = "SETTLEMENT_LOCATION"
+LOCATION_TYPE_ALL = "ALL"
+LOCATION_TYPE_HUB = "Hub"
+LOCATION_TYPE_INTERFACE = "Interface"
+LOCATION_TYPE_SETTLEMENT_LOCATION = "Settlement Location"
 
 QUERY_RTM5_HUBS_URL = "https://pricecontourmap.spp.org/arcgis/rest/services/MarketMaps/RTBM_FeatureData/MapServer/1/query"  # noqa
 QUERY_RTM5_INTERFACES_URL = "https://pricecontourmap.spp.org/arcgis/rest/services/MarketMaps/RTBM_FeatureData/MapServer/2/query"  # noqa
@@ -80,18 +77,11 @@ class SPP(ISOBase):
     ]
 
     location_types = [
+        LOCATION_TYPE_ALL,
         LOCATION_TYPE_HUB,
         LOCATION_TYPE_INTERFACE,
         LOCATION_TYPE_SETTLEMENT_LOCATION,
     ]
-
-    def get_status(self, date=None, verbose=False):
-        if date != "latest":
-            raise NotSupported()
-
-        url = "https://www.spp.org/markets-operations/current-grid-conditions/"
-        html_text = requests.get(url).content.decode("UTF-8")
-        return self._get_status_from_html(html_text)
 
     def get_fuel_mix(self, date, detailed=False, verbose=False):
         """Get fuel mix
@@ -119,7 +109,7 @@ class SPP(ISOBase):
             # many years of historical 5 minute data
             raise NotSupported
 
-        url = "https://marketplace.spp.org/file-browser-api/download/generation-mix-historical?path=%2FGenMix2Hour.csv"  # noqa
+        url = f"{FILE_BROWSER_DOWNLOAD_URL}/generation-mix-historical?path=/GenMix2Hour.csv"  # noqa
         df_raw = pd.read_csv(url)
         historical_mix = process_gen_mix(df_raw, detailed=detailed)
 
@@ -160,6 +150,7 @@ class SPP(ISOBase):
         else:
             # hourly historical zonal loads
             # https://marketplace.spp.org/pages/hourly-load
+            # five minute actual load available here: https://portal.spp.org/pages/stlf-vs-actual#
             raise NotSupported()
 
     def get_load_forecast(self, date, forecast_type="MID_TERM", verbose=False):
@@ -207,10 +198,30 @@ class SPP(ISOBase):
 
         return current_day_forecast
 
+    def _handle_market_end_to_interval(self, df, column, interval_duration):
+        """Converts market end time to interval end time"""
+
+        df = df.rename(
+            columns={
+                column: "Interval End",
+            },
+        )
+
+        df["Interval End"] = pd.to_datetime(df["Interval End"], utc=True).dt.tz_convert(
+            self.default_timezone,
+        )
+
+        df["Interval Start"] = df["Interval End"] - interval_duration
+
+        df["Time"] = df["Interval Start"]
+
+        df = utils.move_cols_to_front(df, ["Time", "Interval Start", "Interval End"])
+
+        return df
+
     def _process_ver_curtailments(self, df):
         df = df.rename(
             columns={
-                "GMTIntervalEnding": "Interval End",
                 "WindRedispatchCurtailments": "Wind Redispatch Curtailments",
                 "WindManualCurtailments": "Wind Manual Curtailments",
                 "WindCurtailedForEnergy": "Wind Curtailed For Energy",
@@ -220,13 +231,11 @@ class SPP(ISOBase):
             },
         )
 
-        df["Interval End"] = pd.to_datetime(df["Interval End"], utc=True).dt.tz_convert(
-            self.default_timezone,
+        df = self._handle_market_end_to_interval(
+            df,
+            column="GMTIntervalEnding",
+            interval_duration=pd.Timedelta(minutes=5),
         )
-
-        df["Interval Start"] = df["Interval End"] - pd.Timedelta(minutes=5)
-
-        df["Time"] = df["Interval Start"]
 
         cols = [
             "Time",
@@ -250,6 +259,87 @@ class SPP(ISOBase):
         return df
 
     @support_date_range("DAY_START")
+    def get_capacity_of_generation_on_outage(self, date, end=None, verbose=False):
+        """Get Capacity of Generation on Outage.
+
+        Published daily at 8am CT for next 7 days
+
+        Args:
+            date: start date
+            end: end date
+
+
+        """
+        url = f"{FILE_BROWSER_DOWNLOAD_URL}/capacity-of-generation-on-outage?path=/{date.strftime('%Y')}/{date.strftime('%m')}/Capacity-Gen-Outage-{date.strftime('%Y%m%d')}.csv"  # noqa
+
+        msg = f"Downloading {url}"
+        log(msg, verbose)
+
+        df = pd.read_csv(url)
+
+        return self._process_capacity_of_generation_on_outage(df, publish_time=date)
+
+    def get_capacity_of_generation_on_outage_annual(self, year, verbose=True):
+        """Get VER Curtailments for a year. Starting 2014.
+        Recent data use get_capacity_of_generation_on_outage
+
+        Args:
+            year: year to get data for
+            verbose: print url
+
+        Returns:
+            pd.DataFrame: VER Curtailments
+        """
+        url = f"{FILE_BROWSER_DOWNLOAD_URL}/capacity-of-generation-on-outage?path=/{year}/{year}.zip"  # noqa
+
+        def process_csv(df, file_name):
+            # infe date from '2020/01/Capacity-Gen-Outage-20200101.csv'
+
+            publish_time_str = file_name.split(".")[0].split("-")[-1]
+            publish_time = pd.to_datetime(publish_time_str).tz_localize(
+                self.default_timezone,
+            )
+
+            df = self._process_capacity_of_generation_on_outage(df, publish_time)
+
+            return df
+
+        df = utils.download_csvs_from_zip_url(
+            url,
+            process_csv=process_csv,
+            verbose=verbose,
+        )
+
+        df = df.sort_values("Interval Start")
+
+        return df
+
+    def _process_capacity_of_generation_on_outage(self, df, publish_time):
+        # strip whitespace from column names
+        df = df.rename(columns=lambda x: x.strip())
+
+        df = self._handle_market_end_to_interval(
+            df,
+            column="Market Hour",
+            interval_duration=pd.Timedelta(minutes=60),
+        )
+
+        df = df.rename(
+            columns={
+                "Outaged MW": "Total Outaged MW",
+            },
+        )
+
+        publish_time = pd.to_datetime(publish_time.normalize())
+
+        df.insert(0, "Publish Time", publish_time)
+
+        # drop Time column
+        df = df.drop(columns=["Time"])
+
+        return df
+
+    @support_date_range("DAY_START")
     def get_ver_curtailments(self, date, end=None, verbose=False):
         """Get VER Curtailments
 
@@ -261,7 +351,7 @@ class SPP(ISOBase):
 
 
         """
-        url = f"https://marketplace.spp.org/file-browser-api/download/ver-curtailments?path=%2F{date.strftime('%Y')}%2F{date.strftime('%m')}%2FVER-Curtailments-{date.strftime('%Y%m%d')}.csv"  # noqa
+        url = f"{FILE_BROWSER_DOWNLOAD_URL}/ver-curtailments?path=/{date.strftime('%Y')}/{date.strftime('%m')}/VER-Curtailments-{date.strftime('%Y%m%d')}.csv"  # noqa
 
         msg = f"Downloading {url}"
         log(msg, verbose)
@@ -280,19 +370,8 @@ class SPP(ISOBase):
         Returns:
             pd.DataFrame: VER Curtailments
         """
-        url = f"https://marketplace.spp.org/file-browser-api/download/ver-curtailments?path=%2F{year}%2F{year}.zip"  # noqa
-        z = utils.get_zip_folder(url, verbose=verbose)
-
-        # iterate through all files in zip
-        # find the one that end with .csv
-        # read that csv
-        all_dfs = []
-        for f in z.filelist:
-            if f.filename.endswith(".csv"):
-                df = pd.read_csv(z.open(f.filename))
-                all_dfs.append(df)
-
-        df = pd.concat(all_dfs)
+        url = f"{FILE_BROWSER_DOWNLOAD_URL}/ver-curtailments?path=/{year}/{year}.zip"  # noqa
+        df = utils.download_csvs_from_zip_url(url, verbose=verbose)
 
         df = self._process_ver_curtailments(df)
 
@@ -303,7 +382,7 @@ class SPP(ISOBase):
         return df
 
     def _get_load_and_forecast(self, verbose=False):
-        url = "https://marketplace.spp.org/chart-api/load-forecast/asChart"
+        url = f"{MARKETPLACE_BASE_URL}/chart-api/load-forecast/asChart"
 
         msg = f"Getting load and forecast from {url}"
         log(msg, verbose)
@@ -330,10 +409,7 @@ class SPP(ISOBase):
         # todo where does date got in argument order
         # def get_historical_lmp(self, date, market: str, nodes: list):
         # 5 minute interal data
-        # https://marketplace.spp.org/file-browser-api/download/rtbm-lmp-by-location?path=/2022/08/By_Interval/08/RTBM-LMP-SL-202208082125.csv
-
-        # hub and interface prices
-        # https://marketplace.spp.org/pages/hub-and-interface-prices
+        # {FILE_BROWSER_API_URL}/rtbm-lmp-by-location?path=/2022/08/By_Interval/08/RTBM-LMP-SL-202208082125.csv
 
         # historical generation mix
         # https://marketplace.spp.org/pages/generation-mix-rolling-365
@@ -399,6 +475,7 @@ class SPP(ISOBase):
             "Cluster Group",
             "Replacement Generator Commercial Op Date",
             "Service Type",
+            "Status (Original)",
         ]
 
         missing = [
@@ -430,8 +507,7 @@ class SPP(ISOBase):
         date,
         end=None,
         market: str = None,
-        locations: list = "ALL",
-        location_type: str = LOCATION_TYPE_HUB,
+        location_type: str = LOCATION_TYPE_ALL,
         verbose=False,
     ):
         """Get LMP data
@@ -441,40 +517,33 @@ class SPP(ISOBase):
             - ``DAY_AHEAD_HOURLY``
 
         Supported Location Types:
-            - ``hub``
-            - ``interface``
-            - ``settlement_location``
+            - ``Hub``
+            - ``Interface``
+            - ``ALL``
         """
         if market not in self.markets:
             raise NotSupported(f"Market {market} not supported")
-        location_type = self._normalize_location_type(location_type)
+
+        if location_type not in self.location_types:
+            raise NotSupported(f"Location type {location_type} not supported")
+
         if market == Markets.REAL_TIME_5_MIN:
             df = self._get_rtm5_lmp(
                 date,
                 end,
-                market,
-                locations,
-                location_type,
                 verbose,
             )
         elif market == Markets.DAY_AHEAD_HOURLY:
+            if date == "latest":
+                raise ValueError("Latest not supported for Day Ahead Hourly")
             df = self._get_dam_lmp(
                 date,
-                end,
-                market,
-                locations,
-                location_type,
                 verbose,
-            )
-        else:
-            raise NotSupported(
-                f"Market {market} is not supported",
             )
 
         return self._finalize_spp_df(
             df,
             market=market,
-            locations=locations,
             location_type=location_type,
             verbose=verbose,
         )
@@ -499,35 +568,39 @@ class SPP(ISOBase):
         self,
         date,
         end=None,
-        market: str = None,
-        locations: list = "ALL",
-        location_type: str = LOCATION_TYPE_HUB,
         verbose=False,
     ):
-        df = self._fetch_and_concat_csvs(
-            self._fs_get_rtbm_lmp_by_location_paths(date, verbose=verbose),
-            fs_name=FS_RTBM_LMP_BY_LOCATION,
-            verbose=verbose,
-        )
+        if date == "latest":
+            urls = [
+                FILE_BROWSER_DOWNLOAD_URL
+                + "/"
+                + FS_RTBM_LMP_BY_LOCATION
+                + "?path=%2FRTBM-LMP-SL-latestInterval.csv",
+            ]
+        else:
+            urls = self._file_browser_list(
+                fs_name=FS_RTBM_LMP_BY_LOCATION,
+                type="folder",
+                path=date.strftime("/%Y/%m/By_Interval/%d"),
+            )["url"].tolist()
+
+        msg = f"Found {len(urls)} files for {date}"
+        log(msg, verbose)
+
+        df = self._fetch_and_concat_csvs(urls, verbose=verbose)
         return df
 
     def _get_dam_lmp(
         self,
         date,
-        end=None,
-        market: str = None,
-        locations: list = "ALL",
-        location_type: str = LOCATION_TYPE_HUB,
         verbose=False,
     ):
-        df = self._fetch_and_concat_csvs(
-            self._fs_get_dam_lmp_by_location_paths(date, verbose=verbose),
-            fs_name=FS_DAM_LMP_BY_LOCATION,
-            verbose=verbose,
-        )
+        url = f"{FILE_BROWSER_DOWNLOAD_URL}/{FS_DAM_LMP_BY_LOCATION}?path=/{date.strftime('%Y')}/{date.strftime('%m')}/By_Day/DA-LMP-SL-{date.strftime('%Y%m%d')}0100.csv"  # noqa
+        log(f"Downloading {url}", verbose=verbose)
+        df = pd.read_csv(url)
         return df
 
-    def _finalize_spp_df(self, df, market, locations, location_type, verbose=False):
+    def _finalize_spp_df(self, df, market, location_type, verbose=False):
         """
         Finalizes DataFrame:
 
@@ -541,62 +614,34 @@ class SPP(ISOBase):
         Arguments:
             pandas.DataFrame: DataFrame with SPP data
             market (str): Market
-            locations (list): List of locations to filter by
             location_type (str): Location type
             verbose (bool, optional): Verbose output
         """
-        df["Interval End"] = pd.to_datetime(
-            df["GMTIntervalEnd"],
-            utc=True,
-        ).dt.tz_convert(self.default_timezone)
-
         if market == Markets.REAL_TIME_5_MIN:
             interval_duration = pd.Timedelta(minutes=5)
         elif market == Markets.DAY_AHEAD_HOURLY:
             interval_duration = pd.Timedelta(hours=1)
 
-        df["Interval Start"] = df["Interval End"] - interval_duration
-        df["Time"] = df["Interval Start"]
+        df = self._handle_market_end_to_interval(
+            df,
+            column="GMTIntervalEnd",
+            interval_duration=interval_duration,
+        )
 
         df["Location"] = df["Settlement Location"]
+        df["PNode"] = df["Pnode"]
 
         df["Market"] = market.value
 
-        if location_type == LOCATION_TYPE_SETTLEMENT_LOCATION:
-            # annotate instead of filter
-            hubs = self._get_location_list(LOCATION_TYPE_HUB, verbose=verbose)
-            hub_name = SPP._get_location_type_name(LOCATION_TYPE_HUB)
+        df["Location Type"] = LOCATION_TYPE_SETTLEMENT_LOCATION
 
-            interfaces = self._get_location_list(
-                LOCATION_TYPE_INTERFACE,
-                verbose=verbose,
-            )
-            interface_name = SPP._get_location_type_name(
-                LOCATION_TYPE_INTERFACE,
-            )
-
-            # Determine Location Type by matching to a hub or interface.
-            # Otherwise, fall back to a settlement location
-            df["Location Type"] = df["Location"].apply(
-                lambda location: SPP._lookup_match(
-                    location,
-                    {
-                        hub_name: hubs,
-                        interface_name: interfaces,
-                    },
-                    default_value=SPP._get_location_type_name(
-                        LOCATION_TYPE_SETTLEMENT_LOCATION,
-                    ),
-                ),
-            )
-        else:
-            # filter
-            location_list = self._get_location_list(
-                location_type,
-                verbose=verbose,
-            )
-            df["Location Type"] = SPP._get_location_type_name(location_type)
-            df = df[df["Location"].isin(location_list)]
+        # Create boolean masks for each location type
+        hubs = self._get_location_list(LOCATION_TYPE_HUB, verbose=verbose)
+        interfaces = self._get_location_list(LOCATION_TYPE_INTERFACE, verbose=verbose)
+        is_hub = df["Location"].isin(hubs)
+        is_interface = df["Location"].isin(interfaces)
+        df.loc[is_hub, "Location Type"] = LOCATION_TYPE_HUB
+        df.loc[is_interface, "Location Type"] = LOCATION_TYPE_INTERFACE
 
         df = df.rename(
             columns={
@@ -606,7 +651,9 @@ class SPP(ISOBase):
                 "MEC": "Energy",
             },
         )
-        df = utils.filter_lmp_locations(df, locations)
+
+        df = utils.filter_lmp_locations(df, location_type=location_type)
+
         df = df[
             [
                 "Time",
@@ -615,6 +662,7 @@ class SPP(ISOBase):
                 "Market",
                 "Location",
                 "Location Type",
+                "PNode",
                 "LMP",
                 "Energy",
                 "Congestion",
@@ -624,40 +672,66 @@ class SPP(ISOBase):
         df = df.reset_index(drop=True)
         return df
 
-    @staticmethod
-    def _lookup_match(item, lookup, default_value):
-        """Use a dictionary to find the first key-value pair
-        where the value is a list containing the item
-        """
-        for key, values_list in lookup.items():
-            if item in values_list:
-                return key
-        return default_value
+    @support_date_range("DAY_START")
+    def get_lmp_real_time_weis(self, date, verbose=False):
+        """Get LMP data for real time WEIS
 
-    @staticmethod
-    def _parse_day_ahead_hour_end(df, timezone):
-        # 'DA_HOUREND': '12/26/2022 9:00:00 AM',
-        return df["DA_HOUREND"].apply(
-            lambda x: (pd.Timestamp(x, tz=timezone) - pd.Timedelta(hours=1)),
+        Args:
+            date: date to get data for
+        """
+
+        # quick implementation using daily files
+        # daily files publish with a few day delay
+        # there are interval files that provide more real time data
+        # also, there are also annual files to handle more more historical data
+
+        url = f"{FILE_BROWSER_DOWNLOAD_URL}/lmp-by-settlement-location-weis?path=/{date.strftime('%Y')}/{date.strftime('%m')}/By_Day/WEIS-RTBM-LMP-DAILY-SL-{date.strftime('%Y%m%d')}.csv"  # noqa
+        msg = f"Downloading {url}"
+        log(msg, verbose)
+        df = pd.read_csv(url)
+
+        return self._process_lmp_real_time_weis(df)
+
+    def _process_lmp_real_time_weis(self, df):
+        # strip whitespace from column names
+        df = df.rename(columns=lambda x: x.strip())
+
+        df = self._handle_market_end_to_interval(
+            df,
+            column="GMT Interval",
+            interval_duration=pd.Timedelta(minutes=5),
         )
 
-    def _normalize_location_type(self, location_type):
-        norm_location_type = location_type.upper()
-        if norm_location_type in self.location_types:
-            return norm_location_type
-        else:
-            raise NotSupported(f"Invalid location_type {location_type}")
+        df["Location Type"] = LOCATION_TYPE_SETTLEMENT_LOCATION
+        df["Market"] = "REAL_TIME_WEIS"
 
-    @staticmethod
-    def _get_location_type_name(location_type):
-        if location_type == LOCATION_TYPE_HUB:
-            return "Hub"
-        elif location_type == LOCATION_TYPE_INTERFACE:
-            return "Interface"
-        elif location_type == LOCATION_TYPE_SETTLEMENT_LOCATION:
-            return "Settlement Location"
-        else:
-            raise ValueError(f"Invalid location_type: {location_type}")
+        df = df.rename(
+            columns={
+                "Settlement Location Name": "Location",
+                "PNODE Name": "PNode",
+                "LMP": "LMP",  # for posterity
+                "MLC": "Loss",
+                "MCC": "Congestion",
+                "MEC": "Energy",
+            },
+        )
+
+        df = df[
+            [
+                "Interval Start",
+                "Interval End",
+                "Market",
+                "Location",
+                "Location Type",
+                "PNode",
+                "LMP",
+                "Energy",
+                "Congestion",
+                "Loss",
+            ]
+        ]
+
+        return df
 
     def _get_location_list(self, location_type, verbose=False):
         if location_type == LOCATION_TYPE_HUB:
@@ -671,77 +745,14 @@ class SPP(ISOBase):
             raise ValueError(f"Invalid location_type: {location_type}")
         return df["SETTLEMENT_LOCATION"].unique().tolist()
 
-    def _fs_get_rtbm_lmp_by_location_paths(self, date, verbose=False):
-        """
-        Lists files for Real-Time Balancing Market (RTBM),
-        Locational Marginal Price (LMP) by Settlement Location (SL)
-        """
-        if date == "latest":
-            paths = ["/RTBM-LMP-SL-latestInterval.csv"]
-        else:
-            files_df = self._file_browser_list(
-                name=FS_RTBM_LMP_BY_LOCATION,
-                fs_name=FS_RTBM_LMP_BY_LOCATION,
-                type="folder",
-                path=date.strftime("/%Y/%m/By_Interval/%d"),
-            )
-            paths = files_df["path"].tolist()
-        msg = f"Found {len(paths)} files for {date}"
-        log(msg, verbose)
-        return paths
-
-    def _fetch_and_concat_csvs(self, paths: list, fs_name: str, verbose: bool = False):
+    def _fetch_and_concat_csvs(self, urls: list, verbose: bool = False):
         all_dfs = []
-        for path in tqdm.tqdm(paths):
-            url = self._file_browser_download_url(
-                fs_name,
-                params={"path": path},
-            )
+        for url in tqdm.tqdm(urls):
             msg = f"Fetching {url}"
             log(msg, verbose)
-
-            csv = requests.get(url)
-            df = pd.read_csv(io.StringIO(csv.content.decode("UTF-8")))
+            df = pd.read_csv(url)
             all_dfs.append(df)
         return pd.concat(all_dfs)
-
-    def _fs_get_dam_lmp_by_location_paths(self, date, verbose=False):
-        """
-        Lists files for Day-ahead Market (DAM),
-        Locational Marginal Price (LMP) by Settlement Location (SL)
-        """
-        paths = []
-        if date == "latest":
-            raise ValueError(
-                "DAM is released daily, so use date='today' instead",
-            )
-
-        date = date.normalize()
-
-        # list files for this month
-        files_df = self._file_browser_list(
-            name=FS_DAM_LMP_BY_LOCATION,
-            fs_name=FS_DAM_LMP_BY_LOCATION,
-            type="folder",
-            path=date.strftime("/%Y/%m/By_Day"),
-        )
-
-        files_df["date"] = files_df.name.apply(
-            lambda x: pd.to_datetime(
-                x.strip(".csv").split("-")[-1],
-                format="%Y%m%d%H%M",
-            )
-            .normalize()
-            .tz_localize(self.default_timezone),
-        )
-
-        matched_file = files_df[files_df["date"] == date]
-        # get latest file
-        paths = matched_file["path"].tolist()
-
-        msg = f"Found {len(paths)} files for {date}"
-        log(msg, verbose)
-        return paths
 
     def _get_marketplace_session(self) -> dict:
         """
@@ -763,13 +774,13 @@ class SPP(ISOBase):
             },
         }
 
-    def _file_browser_list(self, name: str, fs_name: str, type: str, path: str):
+    def _file_browser_list(self, fs_name: str, type: str, path: str):
         """Lists folders in a browser
 
         Returns: pd.DataFrame of files, or empty pd.DataFrame on error"""
         session = self._get_marketplace_session()
         json_payload = {
-            "name": name,
+            "name": fs_name,
             "fsName": fs_name,
             "type": type,
             "path": path,
@@ -782,64 +793,12 @@ class SPP(ISOBase):
         )
         if list_results.status_code == 200:
             df = pd.DataFrame(list_results.json())
+            df["url"] = (
+                FILE_BROWSER_DOWNLOAD_URL + "/" + fs_name + "?path=" + df["path"]
+            )
             return df
         else:
             return pd.DataFrame()
-
-    def _file_browser_download_url(self, fs_name, params=None):
-        qs = "?" + urlencode(params) if params else ""
-        return f"{FILE_BROWSER_API_URL}download/{fs_name}{qs}"
-
-    @staticmethod
-    def _clean_status_text(text):
-        text = text.lower()
-
-        # remove punctuation
-        text = re.sub(r"[,\.\(\)]", "", text)
-        # remove non-time colons
-        text = re.sub(r":$", "", text)
-        # drop time zone information
-        text = re.sub(r"central time", "", text)
-        # truncate starting with last updated
-        text = re.sub(r".*last updated", "", text)
-
-        # drop stop words
-        tokens = text.split(" ")
-        filtered_words = [
-            token for token in tokens if token.lower() not in STATUS_STOP_WORDS
-        ]
-        text = " ".join(filtered_words)
-
-        return text
-
-    @staticmethod
-    def _extract_timestamp(text, year_hint=None, tz=None):
-        if year_hint is None:
-            year_hint = pd.Timestamp.now(tz=tz).year
-        text = SPP._clean_status_text(text)
-
-        year_search = re.search(r"[0-9]{4}", text)
-        if year_search is None:
-            # append year hint
-            text = f"{text} {year_hint}"
-
-        timestamp = None
-
-        try:
-            # throw the remaining bits at pd.Timestamp
-            timestamp = pd.Timestamp(text, tz=tz)
-        except ValueError:
-            pass
-        if timestamp is pd.NaT:
-            timestamp = None
-        return timestamp
-
-    @staticmethod
-    def _extract_timestamps(texts, year_hint=None, tz=None):
-        timestamps = [
-            SPP._extract_timestamp(t, year_hint=year_hint, tz=tz) for t in texts
-        ]
-        return [t for t in timestamps if t is not None]
 
     @staticmethod
     def _match(
@@ -857,116 +816,6 @@ class SPP(ISOBase):
                 for needle in needles
             )
         ]
-
-    @staticmethod
-    def _get_leaf_elements(elems):
-        """Returns leaf elements, i.e. elements without children"""
-        accum = []
-        for elem in elems:
-            parent = False
-            if isinstance(elem, Tag):
-                children = list(elem.children)
-                if len(children) > 0:
-                    for child in children:
-                        accum += SPP._get_leaf_elements([child])
-                        parent = True
-            if not parent:
-                accum.append(elem)
-        return accum
-
-    def _get_status_candidate_texts(self, html):
-        """Returns a list of text candidates for status and timestamp extraction"""
-        # generic pre-Soup cleanup
-        html = re.sub(r"<[/]?span>", "", html)
-        html = re.sub(r"<br/>", "", html)
-        html = re.sub(r"\xa0", "", html)
-        soup = BeautifulSoup(html, "html.parser")
-        # use <h1> as the north star
-        conditions_element = soup.find("h1")
-        # find all sibling paragraphs, and then their descendant leaves
-        sibling_paragraphs = self._get_leaf_elements(
-            conditions_element.parent.find_all("p"),
-        )
-        # just the text, please
-        return [p.text for p in sibling_paragraphs]
-
-    def _get_status_from_html(self, html_text, year_hint=None):
-        """Extracts timestamp, status, and status notes from HTML"""
-        candidate_texts = self._get_status_candidate_texts(html_text)
-        timestamp = self._get_status_timestamp(
-            candidate_texts,
-            year_hint=year_hint,
-        )
-        status, notes = self._get_status_status_and_notes(candidate_texts)
-
-        if timestamp is None:
-            raise RuntimeError("Cannot parse time of status")
-
-        return GridStatus(
-            time=timestamp,
-            status=status,
-            notes=notes,
-            reserves=None,
-            iso=self,
-        )
-
-    def _get_status_timestamp(self, candidate_texts, year_hint=None):
-        """Get timestamp from candidate texts
-
-        Returns
-            pd.Timestamp or None
-        """
-        timestamp_texts = self._match(
-            LAST_UPDATED_KEYWORDS,
-            candidate_texts,
-        )
-
-        new_list = []
-        for text in timestamp_texts:
-            """Truncate to immediately after reliability level,
-            e.g. "blah blah Normal Operations 12:00 PM Central Time"
-            -> "12:00 PM Central Time"
-            """
-            for keyword in RELIABILITY_LEVELS:
-                pos = text.lower().find(keyword.lower())
-                if pos > -1:
-                    pos += len(keyword)
-                    new_list.append(text[pos:])
-            new_list.append(text)
-        timestamp_texts = new_list
-
-        last_updated_timestamps = self._extract_timestamps(
-            timestamp_texts,
-            year_hint=year_hint,
-            tz=self.default_timezone,
-        )
-        return next(iter(last_updated_timestamps), None)
-
-    def _get_status_status_and_notes(self, candidate_texts):
-        """Extracts (status, notes,) tuple from candidates texts"""
-        status_texts = self._match(
-            RELIABILITY_LEVELS,
-            candidate_texts,
-            haystack_norm_fn=lambda x: self._clean_status_text(x),
-        )
-
-        status_text = None
-        if len(status_texts) > 0:
-            status_text = status_texts[0]
-
-        status = status_text  # default
-        notes = None
-
-        norm_status_text = self._clean_status_text(status_text)
-        for level in RELIABILITY_LEVELS:
-            if level.lower() in norm_status_text:
-                status = RELIABILITY_LEVELS_ALIASES.get(level, level)
-                notes = [status_text]
-
-        return (
-            status,
-            notes,
-        )
 
 
 def process_gen_mix(df, detailed=False):

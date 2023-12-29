@@ -143,6 +143,79 @@ class NYISO(ISOBase):
         return df
 
     @support_date_range(frequency="MONTH_START")
+    def get_btm_solar(self, date, end=None, verbose=False):
+        """Returns estimated BTM solar generation at a previous date in hourly
+            intervals for system and each zone.
+
+            Available ~8 hours after the end of the operating day.
+
+        Parameters:
+            date (str, pd.Timestamp, datetime.datetime): Date to get load for.
+              Can be "latest", "today", or a date
+            end (str, pd.Timestamp, datetime.datetime): End date for date range.
+                Optional.
+            verbose (bool): Whether to print verbose output. Optional.
+
+        Returns:
+            pandas.DataFrame: BTM solar data for NYISO system and each zone
+
+        """
+        if date == "latest":
+            return self.get_load(date="today", verbose=verbose)
+
+        data = self._download_nyiso_archive(
+            date=date,
+            end=end,
+            dataset_name="btmactualforecast",
+            filename="BTMEstimatedActual",
+            verbose=verbose,
+        )
+
+        df = data.pivot_table(
+            index=["Time", "Interval Start", "Interval End"],
+            columns="Zone Name",
+            values="MW Value",
+            aggfunc="first",
+        )
+
+        # move system to first column
+        df.insert(0, "SYSTEM", df.pop("SYSTEM"))
+
+        df = df.reset_index()
+
+        df.columns.name = None
+
+        return df
+
+    @support_date_range(frequency="MONTH_START")
+    def get_btm_solar_forecast(self, date, end=None, verbose=False):
+        if date == "latest":
+            return self.get_load(date="today", verbose=verbose)
+
+        data = self._download_nyiso_archive(
+            date=date,
+            end=end,
+            dataset_name="btmdaforecast",
+            verbose=verbose,
+        )
+
+        df = data.pivot_table(
+            index=["Time", "Interval Start", "Interval End"],
+            columns="Zone Name",
+            values="MW Value",
+            aggfunc="first",
+        )
+
+        # move system to first column
+        df.insert(0, "SYSTEM", df.pop("SYSTEM"))
+
+        df = df.reset_index()
+
+        df.columns.name = None
+
+        return df
+
+    @support_date_range(frequency="MONTH_START")
     def get_load_forecast(self, date, end=None, verbose=False):
         """Get load forecast for a date in 1 hour intervals"""
         date = utils._handle_date(date, self.default_timezone)
@@ -641,9 +714,14 @@ class NYISO(ISOBase):
         if filename is None:
             filename = dataset_name
 
-        date = gridstatus.utils._handle_date(date)
+        date = gridstatus.utils._handle_date(date, self.default_timezone)
         month = date.strftime("%Y%m01")
         day = date.strftime("%Y%m%d")
+
+        # if same day, we can just download the single file
+        if end is not None and date.normalize() == end.normalize():
+            end = None
+            date = date.normalize()
 
         # the last 7 days of file are hosted directly as csv
         # todo this can probably be optimized to down single csv if
@@ -671,11 +749,18 @@ class NYISO(ISOBase):
                     date.date(),
                     end.date(),
                     freq="1D",
-                    inclusive="both",
-                )
+                    inclusive="left",
+                ).tolist()
+
+                # if end month is not same as start month, don't add to list
+                # this handles case where end is the first of the next month
+                # this pops up from the support_date_range decorator
+                # and that date will be handled in the next month's zip file
+                if end.month == date.month:
+                    date_range += [end]
 
             for d in date_range:
-                d = gridstatus.utils._handle_date(d)
+                d = gridstatus.utils._handle_date(d, tz=self.default_timezone)
                 month = d.strftime("%Y%m01")
                 day = d.strftime("%Y%m%d")
 
@@ -769,6 +854,10 @@ dataset_interval_map = {
     "realtime": ("end", 5),
     # real time events
     "RealTimeEvents": ("instantaneous", None),
+    # btm solar
+    "btmactualforecast": ("start", 60),
+    # btm solar forecast
+    "btmdaforecast": ("start", 60),
 }
 
 

@@ -14,9 +14,31 @@ def _get_args_dict(fn, args, kwargs):
     return {**dict(zip(args_names, args)), **kwargs}
 
 
+# make custom function rather than using pd.date_range
+# due to handling of localized timezones
+def date_range_maker(start, end, freq, inclusive="neither"):
+    """Generate a date range based on start and end dates and a frequency."""
+    # implement other behavior
+    # if/when needed
+    assert inclusive == "neither"
+
+    if isinstance(freq, str):
+        freq = pd.tseries.frequencies.to_offset(freq)
+
+    # Generate the date range
+    current_date = start + freq
+
+    dates = []
+    while current_date < end:
+        dates.append(current_date)
+        current_date += freq
+
+    return dates
+
+
 class support_date_range:
     def __init__(self, frequency, update_dates=None):
-        """Maximum frequency of ranges"""
+        """Maximum frequency of ranges. if None, then no new ranges are created."""
         self.frequency = frequency
         self.update_dates = update_dates
 
@@ -98,53 +120,41 @@ class support_date_range:
                 args_dict["date"],
             )
 
-            # use .date() to remove timezone info, which doesnt matter
-            # if just a date
-
             # if frequency is callable, then use it to get the frequency
             frequency = self.frequency
             if callable(frequency):
                 frequency = self.frequency(args_dict)
 
-            # Note: this may create a split that will end up
-            # being unnecessary after running update dates below.
-            # that is because after adding new dates, it's possible that two
-            # ranges could be added.
-            # Unnecessary optimization right now to include
-            # logic to handle this
+            if frequency is None:
+                dates = [args_dict["date"], args_dict["end"]]
+            else:
+                # Note: this may create a split that will end up
+                # being unnecessary after running update dates below.
+                # that is because after adding new dates, it's possible that two
+                # ranges could be added.
+                # Unnecessary optimization right now to include
+                # logic to handle this
+                # if certain frequency, we need to handle first interval
+                # specially so pd.date_range works
+                if frequency == "DAY_START":
+                    frequency = DayBeginOffset()
 
-            # if certain frequency, we need to handle first interval
-            # specially so pd.date_range works
-            prepend = []
-            if frequency == "DAY_START":
-                frequency = "1D"
-                next_day_start = args_dict["date"].ceil("1D")
-                if (
-                    next_day_start < args_dict["end"]
-                    and next_day_start != args_dict["date"]
-                ):
-                    prepend = [args_dict["date"]]
-                    args_dict["date"] = args_dict["date"].ceil("1D")
-            elif frequency == "MONTH_START":
-                frequency = "1M"
-                next_month_start = (
-                    args_dict["date"] + pd.offsets.MonthBegin(1)
-                ).normalize()
-                if (
-                    next_month_start < args_dict["end"]
-                    and next_month_start != args_dict["date"]
-                ):
-                    prepend = [args_dict["date"]]
-                    args_dict["date"] = next_month_start
+                elif frequency == "MONTH_START":
+                    frequency = MonthBeginOffset()
 
-            dates = pd.date_range(
-                args_dict["date"],
-                args_dict["end"],
-                freq=frequency,
-                inclusive="neither",
-            )
-            dates = prepend + [args_dict["date"]] + dates.tolist() + [args_dict["end"]]
+                elif frequency == "HOUR_START":
+                    frequency = pd.DateOffset(hours=1)
 
+                dates = date_range_maker(
+                    args_dict["date"],
+                    args_dict["end"],
+                    freq=frequency,
+                    inclusive="neither",
+                )
+                dates = [args_dict["date"]] + dates + [args_dict["end"]]
+
+            # make sure everything is in default timezone
+            # of the ISO
             dates = [
                 gridstatus.utils._handle_date(
                     d,
@@ -152,6 +162,7 @@ class support_date_range:
                 )
                 for d in dates
             ]
+
             # sometime api have restrictions/optimizations based on date ranges
             # update_dates allows for the caller to insert this logic
             if self.update_dates is not None:
@@ -182,7 +193,7 @@ class support_date_range:
                     args_dict["date"] = start_date
 
                     # no need for end if we are querying for just 1 day
-                    if frequency != "1D":
+                    if frequency != "1D" and not isinstance(frequency, DayBeginOffset):
                         args_dict["end"] = end_date
 
                     try:
@@ -215,7 +226,18 @@ class support_date_range:
                 print("Errors that occurred while getting data:")
                 pprint.pprint(errors)
 
-            df = pd.concat(all_df).reset_index(drop=True)
+            # if first item is a dict, then we neeed to concat by key
+            if all_df and isinstance(all_df[0], dict):
+                df = {}
+                for d in all_df:
+                    for k, v in d.items():
+                        if k not in df:
+                            df[k] = []
+                        df[k].append(v)
+                for k, v in df.items():
+                    df[k] = pd.concat(v).reset_index(drop=True)
+            else:
+                df = pd.concat(all_df).reset_index(drop=True)
 
             return df
 
@@ -265,6 +287,7 @@ def _get_pjm_archive_date(market):
     return archive_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+# todo convert to custom PJMDateOffset class
 def pjm_update_dates(dates, args_dict):
     """PJM has a weird API. This method updates the date range list to account
     for the following restrictions:
@@ -348,28 +371,18 @@ def pjm_update_dates(dates, args_dict):
     return new_dates
 
 
-def ercot_update_dates(dates, args_dict):
-    date = args_dict["date"]
-    end = args_dict["end"]
+# custom offset that I dont believe exists in pandas
+class DayBeginOffset:
+    def __ladd__(self, other):
+        return other.normalize() + pd.DateOffset(days=1)
 
-    if date.year == end.year:
-        return dates
+    def __radd__(self, other):
+        return self.__ladd__(other)
 
-    years = {x for x in range(date.year, end.year + 1)}
 
-    fixed_dates = []
+class MonthBeginOffset:
+    def __ladd__(self, other):
+        return other.normalize() + pd.offsets.MonthBegin(1)
 
-    for i, year in enumerate(years):
-        if i == 0:
-            fixed_dates.append(date)
-            fixed_dates.append(pd.Timestamp(year, 12, 31))
-            fixed_dates.append(None)
-        elif i == len(years) - 1:
-            fixed_dates.append(pd.Timestamp(year, 1, 1))
-            fixed_dates.append(end)
-        else:
-            fixed_dates.append(pd.Timestamp(year, 1, 1))
-            fixed_dates.append(pd.Timestamp(year, 12, 31))
-            fixed_dates.append(None)
-
-    return fixed_dates
+    def __radd__(self, other):
+        return self.__ladd__(other)
